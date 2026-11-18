@@ -96,9 +96,11 @@ def verificar_conexion() -> str:
         return "Faltan los secretos db_host, db_user y db_password."
     try:
         with _conexion() as con, con.cursor() as cur:
-            cur.execute("select to_regclass('public.intentos')")
-            if cur.fetchone()[0] is None:
-                return "Falta crear las tablas: ejecuta supabase_schema.sql en el SQL Editor de Supabase."
+            cur.execute("select to_regclass('public.evaluaciones'), to_regclass('public.guias_tutor')")
+            faltan = [n for n, r in zip(("evaluaciones", "guias_tutor"), cur.fetchone()) if r is None]
+            if faltan:
+                return ("Faltan las tablas " + " y ".join(faltan)
+                        + ": ejecuta supabase_schema.sql en el SQL Editor de Supabase.")
         return ""
     except Exception as e:
         return _explicar(e)
@@ -107,12 +109,33 @@ def verificar_conexion() -> str:
 # --------------------------------------------------------------------------- #
 # Operaciones
 # --------------------------------------------------------------------------- #
+def _modelo_actual() -> str | None:
+    """Modelo que respondió por última vez en esta sesión (lo expone tutor.MODELO_GEMINI)."""
+    try:
+        import tutor
+
+        return str(getattr(tutor, "MODELO_GEMINI", "") or "") or None
+    except Exception:
+        return None
+
+
+def _variante_de(clave: str | None, p: Problema) -> str | None:
+    """La app identifica cada pregunta como '<variante>-<id>' (p. ej. 'var-123-P17' o 'modelo-P04')."""
+    if not clave:
+        return None
+    sufijo = f"-{p.id}"
+    return (clave[: -len(sufijo)] if clave.endswith(sufijo) else clave) or "modelo"
+
+
 def verificar_codigo(codigo: str) -> tuple[bool, str]:
-    """Si `codigos_habilitados` tiene filas, solo deja ingresar a esos códigos; si está vacía, acepta cualquiera."""
+    """Si existe `codigos_habilitados` y tiene filas, solo entran esos códigos; si no, entra cualquiera."""
     if not disponible():
         return True, ""
     try:
         with _conexion() as con, con.cursor() as cur:
+            cur.execute("select to_regclass('public.codigos_habilitados')")
+            if cur.fetchone()[0] is None:
+                return True, ""
             cur.execute("select count(*) from codigos_habilitados")
             if cur.fetchone()[0] == 0:
                 return True, ""
@@ -120,31 +143,34 @@ def verificar_codigo(codigo: str) -> tuple[bool, str]:
             if cur.fetchone():
                 return True, ""
         return False, "Código no habilitado. Revisa que esté bien escrito o consulta con tu docente."
-    except Exception as e:  # p. ej. la tabla aún no existe: no bloquear el ingreso
+    except Exception as e:
         _registrar_error(e)
         return True, ""
 
 
+# ---- Tabla 1: evaluaciones (respuestas del estudiante) ---------------------- #
 def guardar_intento(codigo: str, id_sesion: str, n_registro: int, p: Problema, tiempo_seg: int,
                     veredicto: str, puntaje: float | None, respuesta: str,
                     error_tecnico: str | None = None, clave: str | None = None,
                     modelo: str | None = None) -> bool:
-    """Inserta una fila en `intentos`. `fecha_hora_lima` la fija la base de datos (America/Lima).
+    """Inserta una fila en `evaluaciones`. `fecha_hora_lima` la fija la base de datos (America/Lima).
 
-    La columna `clave` guarda la solución de referencia de la pregunta; el argumento `clave`
-    (la etiqueta interna de la app) se acepta por compatibilidad pero no se almacena.
+    `clave` es la etiqueta interna de la pregunta en la app ('<variante>-<id>'): de ahí sale `variante`.
+    La columna `clave` de la tabla guarda, en cambio, la solución de referencia.
     """
     if not disponible():
         return False
     try:
         with _conexion() as con, con.cursor() as cur:
             cur.execute(
-                """insert into intentos
-                   (codigo, id_sesion, n_registro_sesion, tema, dimension, tiempo_resp_seg, veredicto,
-                    puntaje, long_respuesta, modelo, error_tecnico, enunciado, pedido, respuesta, clave)
-                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (codigo, id_sesion, n_registro, p.tema, p.dimension, tiempo_seg, veredicto,
-                 puntaje, len(respuesta), modelo, error_tecnico[:1000] if error_tecnico else None,
+                """insert into evaluaciones
+                   (codigo, id_sesion, n_registro_sesion, id_pregunta, variante, tema, dimension,
+                    tiempo_resp_seg, veredicto, puntaje, puntaje_max, long_respuesta, modelo, error_tecnico,
+                    enunciado, pedido, respuesta, clave)
+                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (codigo, id_sesion, n_registro, p.id, _variante_de(clave, p) or "modelo", p.tema, p.dimension,
+                 tiempo_seg, veredicto, puntaje, p.puntaje_max, len(respuesta), modelo or _modelo_actual(),
+                 error_tecnico[:1000] if error_tecnico else None,
                  f"{p.contexto}\n{getattr(p, 'datos_texto', '')}".strip(), p.enunciado, respuesta, p.referencia),
             )
         return True
@@ -153,15 +179,36 @@ def guardar_intento(codigo: str, id_sesion: str, n_registro: int, p: Problema, t
         return False
 
 
-def guardar_mensaje(codigo: str, id_sesion: str, p: Problema, rol: str, contenido: str, nivel_pista: int) -> bool:
+# ---- Tabla 2: guias_tutor (ayuda que recibe el estudiante) ------------------ #
+def guardar_mensaje(codigo: str, id_sesion: str, p: Problema, rol: str, contenido: str, nivel_pista: int,
+                    clave: str | None = None, modelo: str | None = None) -> bool:
+    """Registra UNA fila por interacción con el tutor.
+
+    La app llama primero con rol='estudiante' (se guarda en memoria) y luego con rol='tutor':
+    en ese momento se inserta la fila completa en `guias_tutor` con la consulta y la guía.
+    """
     if not disponible():
         return False
+    if rol == "estudiante":
+        st.session_state["_consulta_pendiente"] = {"texto": contenido, "nivel": nivel_pista, "clave": clave}
+        return True
+
+    pendiente = st.session_state.pop("_consulta_pendiente", None) or {}
+    consulta = pendiente.get("texto") or ""
+    tipo = "pista" if consulta.lower().startswith("necesito una pista") else "consulta"
+    variante = _variante_de(clave or pendiente.get("clave"), p)
     try:
         with _conexion() as con, con.cursor() as cur:
             cur.execute(
-                """insert into mensajes (codigo, id_sesion, tema, dimension, rol, contenido, nivel_pista)
-                   values (%s, %s, %s, %s, %s, %s, %s)""",
-                (codigo, id_sesion, p.tema, p.dimension, rol, contenido, nivel_pista),
+                """insert into guias_tutor
+                   (codigo, id_sesion, n_registro_sesion, id_pregunta, variante, tema, dimension,
+                    tipo, nivel_pista, modelo, long_guia, consulta_estudiante, guia_tutor)
+                   values (%s, %s,
+                           (select coalesce(max(n_registro_sesion), 0) + 1 from guias_tutor where id_sesion = %s),
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (codigo, id_sesion, id_sesion, p.id, variante, p.tema, p.dimension,
+                 tipo, pendiente.get("nivel", nivel_pista), modelo or _modelo_actual(),
+                 len(contenido), consulta, contenido),
             )
         return True
     except Exception as e:
@@ -169,15 +216,16 @@ def guardar_mensaje(codigo: str, id_sesion: str, p: Problema, rol: str, contenid
         return False
 
 
+# ---- Lectura para "Mi progreso" ---------------------------------------------- #
 def cargar_intentos(codigo: str) -> pd.DataFrame:
-    """Intentos evaluados del estudiante (excluye los que fallaron por error técnico)."""
+    """Evaluaciones del estudiante (excluye las que fallaron por error técnico)."""
     if not disponible():
         return pd.DataFrame()
     try:
         import psycopg2.extras
 
         with _conexion() as con, con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("select * from intentos where codigo = %s order by id desc limit 500", (codigo,))
+            cur.execute("select * from evaluaciones where codigo = %s order by id desc limit 500", (codigo,))
             df = pd.DataFrame(cur.fetchall())
     except Exception as e:
         _registrar_error(e)
