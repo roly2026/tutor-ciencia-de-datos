@@ -1,8 +1,8 @@
 """Preparador del examen final · Introducción a Data Science.
 
-Flujo: código de estudiante -> tema -> (dimensión) -> pregunta -> práctica / tutor / progreso.
+Flujo: código de estudiante -> tema -> (dimensión / área / tipo de gráfico) -> pregunta -> práctica / tutor / progreso.
 Temas: Clasificación y Regresión (por dimensión del razonamiento cuantitativo),
-       Scikit-learn y Reportes de datos (preguntas teóricas de respuesta escrita).
+       Scikit-learn (código por área) y Reportes de datos (interpretación de gráficos): preguntas de respuesta escrita.
 
 Ejecutar:  streamlit run app.py
 """
@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -20,30 +21,35 @@ import base_datos as bd
 import tutor
 from config import DIMENSIONES, MAX_CARACTERES_RESPUESTA, MAX_PISTAS, PUNTAJE_MAX, secreto
 from problemas import Problema, obtener_problemas
-from problemas_teoria import TEMA_REPORTES, TEMA_SKLEARN, obtener_teoria
+from problemas_teoria import TEMA_REPORTES, TEMA_SKLEARN, dimensiones_teoria, obtener_teoria
 
 st.set_page_config(page_title="Preparador EF · Intro a Data Science", page_icon="📊", layout="wide")
 
 SECCIONES = ["📝 Práctica", "💬 Tutor", "📊 Mi progreso"]
 CODIGO_RE = re.compile(r"^[A-Z0-9_-]{4,20}$")
 
-TEMAS_CUANTI = ["Clasificación", "Regresión"]          # se practican por dimensión
-TEMAS_TEORIA = [TEMA_SKLEARN, TEMA_REPORTES]            # preguntas teóricas escritas
-TODAS = "Todas las dimensiones"
+TEMAS_CUANTI = ["Clasificación", "Regresión"]          # se practican por dimensión del razonamiento cuantitativo
+TEMAS_TEORIA = [TEMA_SKLEARN, TEMA_REPORTES]            # preguntas de respuesta escrita
+TODAS = "Todas"
 
-# Ficha de cada tema para la pantalla de selección
 FICHAS = {
     "Clasificación": ("🎯", "Clasificación binaria",
                       "Matriz de confusión, exactitud, precisión, recall y decisiones de negocio (Caso 1: banco)."),
     "Regresión": ("📈", "Regresión",
                   "Errores MAE, RMSE, MAPE, R² y su lectura en el negocio (Caso 2: inmobiliaria)."),
     TEMA_SKLEARN: ("🧰", "Scikit-learn",
-                   "Uso del código de modelamiento: particiones, pipelines, validación cruzada, métricas e hiperparámetros."),
+                   "Escribe el código de modelamiento en clasificación y regresión: pipelines, métricas, validación cruzada e hiperparámetros."),
     TEMA_REPORTES: ("🗂️", "Presentación de reportes",
-                    "Estructura, gráficos, comunicación de métricas, limitaciones y recomendaciones."),
+                    "Interpreta gráficos de barras simples y dobles, dispersión y cajas, y comunica resultados."),
 }
-DIM_ICONO = {"Representación": "🧩", "Cálculo": "🧮", "Interpretación": "🔍",
-             "Análisis": "⚖️", "Argumentación": "🗣️"}
+TIPO_PREGUNTA = {
+    "Clasificación": "Preguntas por dimensión", "Regresión": "Preguntas por dimensión",
+    TEMA_SKLEARN: "Preguntas de código y teoría (por área)", TEMA_REPORTES: "Interpretación de gráficos (por tipo)",
+}
+ICONOS = {"Representación": "🧩", "Cálculo": "🧮", "Interpretación": "🔍", "Análisis": "⚖️", "Argumentación": "🗣️",
+          "Clasificación": "🎯", "Regresión": "📈", "General": "🧭",
+          "Barras simples": "📊", "Barras dobles": "📊", "Dispersión": "🔵", "Cajas (boxplot)": "📦",
+          "Comunicación del reporte": "📝"}
 
 
 # --------------------------------------------------------------------------- #
@@ -65,6 +71,20 @@ def _es_teoria(tema: str) -> bool:
 def _resumen(texto: str, n: int = 70) -> str:
     texto = " ".join(texto.split())
     return texto if len(texto) <= n else texto[: n - 1].rstrip() + "…"
+
+
+def _nombre_modelo() -> str:
+    """Nombre del modelo de IA que evalúa (para registrarlo en la base de datos)."""
+    for nombre in ("MODELO", "MODELO_GEMINI", "MODEL", "MODEL_NAME", "GEMINI_MODEL"):
+        valor = getattr(tutor, nombre, None)
+        if isinstance(valor, str) and valor:
+            return valor
+    return str(secreto("GEMINI_MODEL") or "gemini")
+
+
+def _elegir_al_azar(clave_widget: str, opciones: list) -> None:
+    """Callback del botón 🎲 (los callbacks sí pueden modificar el estado de un widget ya creado)."""
+    st.session_state[clave_widget] = random.choice(opciones)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,12 +118,12 @@ def pantalla_bienvenida() -> None:
     st.write("Practica para tu examen final con retroalimentación inmediata basada en la rúbrica del curso.")
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**Temas cuantitativos**\n\n- 🎯 Clasificación binaria\n- 📈 Regresión\n\n"
-                    "Elige la dimensión del razonamiento cuantitativo que quieres reforzar: interpretación, "
-                    "representación, cálculo, análisis o argumentación.")
+        st.markdown("**Razonamiento cuantitativo**\n\n- 🎯 Clasificación binaria\n- 📈 Regresión\n\n"
+                    "Elige la dimensión que quieres reforzar: interpretación, representación, cálculo, análisis o argumentación.")
     with c2:
-        st.markdown("**Temas teóricos**\n\n- 🧰 Scikit-learn para modelamiento\n- 🗂️ Presentación de reportes\n\n"
-                    "Responde por escrito preguntas conceptuales como las del examen.")
+        st.markdown("**Respuesta escrita**\n\n- 🧰 Scikit-learn: código en clasificación y regresión\n"
+                    "- 🗂️ Reportes: interpretación de gráficos (barras, dispersión, cajas)\n\n"
+                    "Escribe tu respuesta como en el examen.")
     st.info("Ingresa con tu código de estudiante en la barra lateral para comenzar.")
 
 
@@ -112,7 +132,7 @@ def pantalla_bienvenida() -> None:
 # --------------------------------------------------------------------------- #
 def pantalla_temas() -> None:
     st.title("¿Qué quieres practicar hoy?")
-    st.caption("Elige un tema. Luego podrás escoger la dimensión (en Clasificación y Regresión) y la pregunta.")
+    st.caption("Elige un tema; luego filtra por dimensión, área o tipo de gráfico y escoge la pregunta.")
     orden = list(FICHAS)
     for fila in (orden[:2], orden[2:]):
         cols = st.columns(2)
@@ -121,16 +141,14 @@ def pantalla_temas() -> None:
             with col.container(border=True):
                 st.markdown(f"### {icono} {titulo}")
                 st.write(descripcion)
-                kind = "Preguntas por dimensión" if tema in TEMAS_CUANTI else "Preguntas teóricas de desarrollo"
-                st.caption(kind)
-                if st.button(f"Practicar {titulo.lower()}", key=f"tema_{tema}", type="primary",
-                             use_container_width=True):
+                st.caption(TIPO_PREGUNTA[tema])
+                if st.button(f"Practicar {titulo.lower()}", key=f"tema_{tema}", type="primary", use_container_width=True):
                     st.session_state.tema = tema
                     st.rerun()
 
 
 # --------------------------------------------------------------------------- #
-# Barra lateral con sesión iniciada: tema, dimensión y pregunta
+# Barra lateral con sesión iniciada
 # --------------------------------------------------------------------------- #
 def sidebar() -> tuple[Problema, str] | None:
     with st.sidebar:
@@ -150,6 +168,8 @@ def sidebar() -> tuple[Problema, str] | None:
             st.warning("Supabase no está configurado: tu avance no se guardará.")
         elif st.session_state.get("db_error"):
             st.warning("No se pudo guardar algún dato en Supabase.")
+            with st.expander("Detalle técnico"):
+                st.code(st.session_state["db_error"])
 
         tema = st.session_state.tema
         if tema is None:
@@ -158,10 +178,7 @@ def sidebar() -> tuple[Problema, str] | None:
         icono, titulo, _ = FICHAS[tema]
         st.divider()
         st.markdown(f"**Tema:** {icono} {titulo}")
-
-        if _es_teoria(tema):
-            return _seleccion_teoria(tema)
-        return _seleccion_cuantitativa(tema)
+        return _seleccion_teoria(tema) if _es_teoria(tema) else _seleccion_cuantitativa(tema)
 
 
 def _seleccion_cuantitativa(tema: str) -> tuple[Problema, str] | None:
@@ -177,8 +194,7 @@ def _seleccion_cuantitativa(tema: str) -> tuple[Problema, str] | None:
         semilla, etiqueta = None, "modelo"
 
     dimension = st.radio("Dimensión a practicar", [TODAS] + DIMENSIONES,
-                         format_func=lambda d: d if d == TODAS else f"{DIM_ICONO.get(d, '•')} {d}")
-
+                         format_func=lambda d: d if d == TODAS else f"{ICONOS.get(d, '•')} {d}")
     opciones = [p for p in obtener_problemas(semilla) if p.tema == tema]
     if dimension != TODAS:
         opciones = [p for p in opciones if p.dimension == dimension]
@@ -188,54 +204,105 @@ def _seleccion_cuantitativa(tema: str) -> tuple[Problema, str] | None:
 
     def fmt(p: Problema) -> str:
         base = f"P{p.numero}" + (" ★" if p.es_modelo else "")
-        extra = f"{p.dimension}" if dimension == TODAS else _resumen(p.enunciado, 45)
-        return f"{base} · {extra}"
+        return f"{base} · {p.dimension if dimension == TODAS else _resumen(p.enunciado, 45)}"
 
-    # clave del selectbox ligada a tema+dimensión para que no arrastre una pregunta que ya no existe
-    p = st.selectbox(f"Pregunta ({len(opciones)})", opciones, format_func=fmt,
-                     key=f"preg_{tema}_{dimension}_{etiqueta}")
+    clave_w = f"preg_{tema}_{dimension}_{etiqueta}"   # ligada a tema+dimensión+variante
+    p = st.selectbox(f"Pregunta ({len(opciones)})", opciones, format_func=fmt, key=clave_w)
     st.caption("★ = pregunta del examen modelo")
-    if st.button("🎲 Pregunta al azar", use_container_width=True):
-        st.session_state[f"preg_{tema}_{dimension}_{etiqueta}"] = random.choice(opciones)
-        st.rerun()
+    st.button("🎲 Pregunta al azar", use_container_width=True, on_click=_elegir_al_azar, args=(clave_w, opciones))
     return p, f"{etiqueta}-{p.id}"
 
 
 def _seleccion_teoria(tema: str) -> tuple[Problema, str] | None:
+    etiqueta_filtro = "Área de uso" if tema == TEMA_SKLEARN else "Tipo de gráfico / contenido"
+    dimension = st.radio(etiqueta_filtro, [TODAS] + dimensiones_teoria(tema),
+                         format_func=lambda d: d if d == TODAS else f"{ICONOS.get(d, '•')} {d}")
     opciones = obtener_teoria(tema)
-    p = st.selectbox(f"Pregunta ({len(opciones)})", opciones,
-                     format_func=lambda x: f"T{x.numero} · {getattr(x, 'subtema', '') or _resumen(x.enunciado, 40)}",
-                     key=f"preg_{tema}")
-    st.caption("Preguntas teóricas: responde por escrito, con tus palabras.")
-    if st.button("🎲 Pregunta al azar", use_container_width=True):
-        st.session_state[f"preg_{tema}"] = random.choice(opciones)
-        st.rerun()
+    if dimension != TODAS:
+        opciones = [p for p in opciones if p.dimension == dimension]
+    if not opciones:
+        st.warning("No hay preguntas para esta selección.")
+        return None
+
+    def fmt(p: Problema) -> str:
+        return f"{p.id} · {p.dimension if dimension == TODAS else _resumen(p.enunciado, 45)}"
+
+    clave_w = f"preg_{tema}_{dimension}"
+    p = st.selectbox(f"Pregunta ({len(opciones)})", opciones, format_func=fmt, key=clave_w)
+    st.caption("Respuesta escrita: desarróllala con tus palabras.")
+    st.button("🎲 Pregunta al azar", use_container_width=True, on_click=_elegir_al_azar, args=(clave_w, opciones))
     return p, f"teo-{p.id}"
 
 
 # --------------------------------------------------------------------------- #
 # Presentación del problema
 # --------------------------------------------------------------------------- #
+def _grafico(d: dict) -> alt.Chart:
+    """Dibuja los gráficos de las preguntas de reportes (barras, barras dobles, dispersión y cajas)."""
+    tipo, titulo = d["grafico"], d.get("titulo", "")
+    xt, yt = d.get("x_titulo", ""), d.get("y_titulo", "")
+    if tipo == "barras":
+        df = pd.DataFrame({"categoria": d["categorias"], "valor": d["valores"]})
+        base = alt.Chart(df).encode(x=alt.X("categoria:N", sort=None, title=xt, axis=alt.Axis(labelAngle=0)),
+                                    y=alt.Y("valor:Q", title=yt, scale=alt.Scale(domainMin=0)))
+        capas = base.mark_bar() + base.mark_text(dy=-8).encode(text=alt.Text("valor:Q", format=".1f"))
+        if d.get("referencia_y") is not None:
+            capas += alt.Chart(pd.DataFrame({"y": [d["referencia_y"]]})).mark_rule(strokeDash=[5, 4]).encode(y="y:Q")
+        return capas.properties(title=titulo, height=320)
+    if tipo == "barras_dobles":
+        filas = [{"categoria": c, "serie": s, "valor": v}
+                 for s, vals in d["series"].items() for c, v in zip(d["categorias"], vals)]
+        df = pd.DataFrame(filas)
+        return (alt.Chart(df).mark_bar()
+                .encode(x=alt.X("categoria:N", sort=None, title=xt, axis=alt.Axis(labelAngle=0)),
+                        xOffset="serie:N",
+                        y=alt.Y("valor:Q", title=yt, scale=alt.Scale(domainMin=0)),
+                        color=alt.Color("serie:N", title=None),
+                        tooltip=["categoria", "serie", "valor"])
+                .properties(title=titulo, height=320))
+    if tipo == "dispersion":
+        df = pd.DataFrame({"x": d["x"], "y": d["y"]})
+        capas = (alt.Chart(df).mark_circle(size=90, opacity=0.8)
+                 .encode(x=alt.X("x:Q", title=xt, scale=alt.Scale(zero=False)),
+                         y=alt.Y("y:Q", title=yt, scale=alt.Scale(zero=False)), tooltip=["x", "y"]))
+        if d.get("diagonal"):
+            lo, hi = min(min(d["x"]), min(d["y"])), max(max(d["x"]), max(d["y"]))
+            capas += (alt.Chart(pd.DataFrame({"x": [lo, hi], "y": [lo, hi]}))
+                      .mark_line(strokeDash=[6, 4]).encode(x="x:Q", y="y:Q"))
+        return capas.properties(title=titulo, height=340)
+    # cajas
+    filas = [{"grupo": g, "valor": v} for g, vals in d["grupos"].items() for v in vals]
+    df = pd.DataFrame(filas)
+    return (alt.Chart(df).mark_boxplot(extent=1.5, size=60)
+            .encode(x=alt.X("grupo:N", sort=None, title=xt, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("valor:Q", title=yt, scale=alt.Scale(zero=False)),
+                    color=alt.Color("grupo:N", legend=None))
+            .properties(title=titulo, height=340))
+
+
 def mostrar_datos(p: Problema) -> None:
     d = p.datos or {}
-    if d.get("tipo") == "matriz":
+    tipo = d.get("tipo")
+    if tipo == "matriz":
         df = pd.DataFrame(
             [[f"VP = {d['vp']}", f"FN = {d['fn']}"], [f"FP = {d['fp']}", f"VN = {d['vn']}"]],
             index=["Real: Acepta (1)", "Real: Rechaza (0)"],
             columns=["Predicción: Acepta (1)", "Predicción: Rechaza (0)"],
         )
         st.table(df)
-    elif d.get("tipo") == "tabla":
+    elif tipo == "tabla":
         df = pd.DataFrame({"Valor real (y)": d["real"], "Predicción (ŷ)": d["pred"]},
                           index=[f"Depto {i}" for i in range(1, len(d["real"]) + 1)])
         st.table(df)
+    elif tipo == "grafico":
+        st.altair_chart(_grafico(d), use_container_width=True)
 
 
 def encabezado(p: Problema) -> None:
     if _es_teoria(p.tema):
-        sub = getattr(p, "subtema", "")
-        st.markdown(f"**{p.tema}**" + (f" · {sub}" if sub else ""))
+        st.markdown(f"**{p.tema} · {p.dimension}**")
         st.caption(p.contexto)
+        mostrar_datos(p)
     else:
         st.markdown(f"**Caso {p.caso} · {p.tema}.** {p.contexto}")
         mostrar_datos(p)
@@ -247,11 +314,11 @@ def encabezado(p: Problema) -> None:
 # --------------------------------------------------------------------------- #
 # Sección: práctica
 # --------------------------------------------------------------------------- #
-def _registrar_intento(p: Problema, respuesta: str, segundos: int, veredicto: str,
+def _registrar_intento(p: Problema, clave: str, respuesta: str, segundos: int, veredicto: str,
                        puntaje: float | None, error: str | None) -> None:
     st.session_state.n_registro += 1
     bd.guardar_intento(st.session_state.codigo, st.session_state.id_sesion, st.session_state.n_registro,
-                       p, segundos, veredicto, puntaje, respuesta, error)
+                       p, segundos, veredicto, puntaje, respuesta, error, clave=clave, modelo=_nombre_modelo())
 
 
 def seccion_practica(p: Problema, clave: str) -> None:
@@ -259,11 +326,13 @@ def seccion_practica(p: Problema, clave: str) -> None:
     st.session_state.t0.setdefault(clave, time.time())
 
     teoria = _es_teoria(p.tema)
-    placeholder = ("Redacta tu respuesta teórica con tus palabras; si ayuda, incluye un fragmento corto de código…"
-                   if p.tema == TEMA_SKLEARN else
-                   "Redacta tu respuesta como lo harías en el examen…" if teoria else
-                   "Desarrolla tu respuesta como lo harías en el examen…")
-    texto = st.text_area("Tu respuesta", key=f"resp_{clave}", height=300 if teoria else 220,
+    if p.tema == TEMA_SKLEARN:
+        placeholder = "Escribe tu código y/o tu explicación. Puedes usar bloques de código con ``` …"
+    elif p.tema == TEMA_REPORTES:
+        placeholder = "Interpreta el gráfico con cifras y redacta tu conclusión como en el examen…"
+    else:
+        placeholder = "Desarrolla tu respuesta como lo harías en el examen…"
+    texto = st.text_area("Tu respuesta", key=f"resp_{clave}", height=320 if teoria else 220,
                          max_chars=MAX_CARACTERES_RESPUESTA, placeholder=placeholder)
     if st.button("✅ Evaluar mi respuesta", type="primary", key=f"eval_{clave}"):
         respuesta = texto.strip()
@@ -275,10 +344,10 @@ def seccion_practica(p: Problema, clave: str) -> None:
                 with st.spinner("Evaluando con la rúbrica…"):
                     evaluacion = tutor.evaluar_respuesta(p, respuesta)
             except tutor.ErrorIA as e:
-                _registrar_intento(p, respuesta, segundos, "Error técnico", None, str(e))
+                _registrar_intento(p, clave, respuesta, segundos, "Error técnico", None, str(e))
                 st.error(str(e))
             else:
-                _registrar_intento(p, respuesta, segundos, evaluacion["nivel"], evaluacion["puntaje"], None)
+                _registrar_intento(p, clave, respuesta, segundos, evaluacion["nivel"], evaluacion["puntaje"], None)
                 st.session_state.resultados[clave] = evaluacion
             st.session_state.t0[clave] = time.time()
 
@@ -295,11 +364,15 @@ def seccion_practica(p: Problema, clave: str) -> None:
             if evaluacion["sugerencia"]:
                 st.info(evaluacion["sugerencia"])
         with st.expander("Ver solución modelo"):
-            st.write(p.referencia)
-            msg = ("Revisa la solución solo después de intentarlo; vuelve a responder con otras palabras."
-                   if teoria else
-                   "Revisa la solución solo después de intentarlo; inténtalo de nuevo con una variante nueva.")
-            st.caption(msg)
+            if p.tema == TEMA_SKLEARN and "\n\n" in p.referencia:
+                codigo, explicacion = p.referencia.rsplit("\n\n", 1)   # código + párrafo final de explicación
+                st.code(codigo, language="python")
+                st.write(explicacion)
+            else:
+                st.write(p.referencia)
+            st.caption("Revisa la solución solo después de intentarlo; "
+                       + ("vuelve a responder con otras palabras." if teoria
+                          else "inténtalo de nuevo con una variante nueva."))
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +429,7 @@ def seccion_progreso() -> None:
         st.info("Aún no hay intentos guardados. Evalúa una respuesta en la sección Práctica.")
         return
 
-    df["logro"] = df["puntaje"] / PUNTAJE_MAX * 100
+    df["logro"] = pd.to_numeric(df["puntaje"], errors="coerce") / PUNTAJE_MAX * 100
     validos = df.dropna(subset=["puntaje"])
 
     m1, m2, m3 = st.columns(3)
@@ -364,10 +437,9 @@ def seccion_progreso() -> None:
     m2.metric("Logro promedio", f"{validos['logro'].mean():.0f} %" if len(validos) else "—")
     m3.metric("Temas practicados", validos["tema"].nunique() if len(validos) else 0)
 
-    st.markdown("**Logro (%) por tema**")
-    por_tema = validos.groupby("tema")["logro"].mean().round(1)
-    if len(por_tema):
-        st.bar_chart(por_tema, y_label="Logro promedio (%)")
+    if len(validos):
+        st.markdown("**Logro (%) por tema**")
+        st.bar_chart(validos.groupby("tema")["logro"].mean().round(1), y_label="Logro promedio (%)")
 
     cuanti = validos[validos["tema"].isin(TEMAS_CUANTI)]
     if not cuanti.empty:
@@ -382,8 +454,9 @@ def seccion_progreso() -> None:
 
     teoria = validos[validos["tema"].isin(TEMAS_TEORIA)]
     if not teoria.empty:
-        peor = teoria.groupby("tema")["logro"].mean().idxmin()
-        st.info(f"Temas teóricos: el de menor logro es **{peor}**.")
+        st.markdown("**Scikit-learn y Reportes · logro (%) por área o tipo de gráfico**")
+        tabla = teoria.pivot_table(index="dimension", columns="tema", values="logro", aggfunc="mean").round(0)
+        st.dataframe(tabla, use_container_width=True)
 
     st.markdown("**Últimos intentos**")
     columnas = ["fecha_hora_lima", "tema", "dimension", "veredicto", "puntaje", "tiempo_resp_seg"]
@@ -403,8 +476,7 @@ def main() -> None:
 
     seleccion = sidebar()
 
-    # Sin tema elegido: pantalla de selección (el progreso también es accesible desde aquí)
-    if st.session_state.tema is None:
+    if st.session_state.tema is None:   # sin tema elegido: selección de tema (y progreso)
         pestanas = st.tabs(["🧭 Elegir tema", "📊 Mi progreso"])
         with pestanas[0]:
             pantalla_temas()
