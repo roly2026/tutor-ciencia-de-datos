@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from functools import lru_cache
 
 from google import genai
 from google.genai import types
 
-from config import MAX_CARACTERES_RESPUESTA, MODELO_GEMINI, secreto
+from config import MAX_CARACTERES_RESPUESTA, MODELOS_GEMINI, secreto
 from problemas import Problema
 
 
@@ -67,22 +68,38 @@ def _cliente() -> genai.Client:
     return genai.Client(api_key=clave)
 
 
+# Modelo que respondió por última vez en ESTA sesión (cada sesión de Streamlit corre en su propio hilo).
+_ultimo = threading.local()
+
+
+def __getattr__(nombre: str):
+    """tutor.MODELO_GEMINI = modelo que realmente respondió (lo usa app.py para registrarlo en Supabase)."""
+    if nombre == "MODELO_GEMINI":
+        return getattr(_ultimo, "modelo", MODELOS_GEMINI[0])
+    raise AttributeError(nombre)
+
+
 def _generar(sistema: str, contenido, json_mode: bool = False, temperatura: float = 0.2) -> str:
     config = types.GenerateContentConfig(
         system_instruction=sistema,
         temperature=temperatura,
         response_mime_type="application/json" if json_mode else None,
     )
-    try:
-        r = _cliente().models.generate_content(model=MODELO_GEMINI, contents=contenido, config=config)
-    except ErrorIA:
-        raise
-    except Exception as e:  # red, cuota, modelo inexistente, etc.
-        raise ErrorIA(f"No se pudo contactar al modelo ({MODELO_GEMINI}): {e}") from e
-    texto = (r.text or "").strip()
-    if not texto:
-        raise ErrorIA("El modelo devolvió una respuesta vacía. Intenta de nuevo.")
-    return texto
+    fallos: list[str] = []
+    for modelo in MODELOS_GEMINI:  # el primero es el principal; los siguientes, respaldo
+        try:
+            r = _cliente().models.generate_content(model=modelo, contents=contenido, config=config)
+        except ErrorIA:
+            raise
+        except Exception as e:  # red, cuota, sobrecarga, modelo inexistente, etc.
+            fallos.append(f"{modelo}: {str(e)[:200]}")
+            continue
+        texto = (r.text or "").strip()
+        if texto:
+            _ultimo.modelo = modelo
+            return texto
+        fallos.append(f"{modelo}: respuesta vacía")
+    raise ErrorIA("No se pudo contactar al modelo. " + " | ".join(fallos))
 
 
 def _parse_json(texto: str) -> dict:
