@@ -104,14 +104,32 @@ def _asegurar_esquema() -> None:
 # --------------------------------------------------------------------------- #
 # Acceso por código
 # --------------------------------------------------------------------------- #
+def _leer_secreto_crudo(clave: str):
+    """Lee un secreto sin convertirlo a texto (config.secreto puede aplanar las listas)."""
+    try:
+        if clave in st.secrets:
+            return st.secrets[clave]
+    except Exception:  # noqa: BLE001 - sin archivo de secretos o fuera de Streamlit
+        pass
+    return secreto(clave)
+
+
 def _codigos_secretos() -> set[str]:
     """Códigos autorizados definidos en los secretos (`codigos = [...]`). Vacío si no hay lista."""
-    bruto = secreto("codigos")
+    bruto = _leer_secreto_crudo("codigos")
     if not bruto:
         return set()
-    if isinstance(bruto, str):          # por si se pegó como texto: "1001,1002" o con saltos de línea
-        bruto = re.split(r"[\s,;]+", bruto)
-    return {str(c).strip().upper() for c in bruto if str(c).strip()}
+    if isinstance(bruto, str):          # texto: "1001,1002", con saltos de línea o con formato de lista
+        bruto = re.findall(r"[A-Za-z0-9_-]+", bruto)
+    try:
+        return {str(c).strip().upper() for c in bruto if str(c).strip()}
+    except TypeError:
+        return set()
+
+
+def n_codigos_cargados() -> int:
+    """Cantidad de códigos autorizados que la app logró leer de los secretos (para diagnóstico)."""
+    return len(_codigos_secretos())
 
 
 def verificar_codigo(codigo: str) -> tuple[bool, str]:
@@ -159,7 +177,8 @@ def probar_conexion() -> tuple[bool, str]:
     filas = _ejecutar("select count(*) as n from public.intentos", leer=True)
     if filas is None:
         return False, st.session_state.get("db_error", "No se pudo leer public.intentos.")
-    return True, f"Conectado a {cred['host']} (usuario {cred['user']}). Intentos guardados: {filas[0]['n']}."
+    return True, (f"Conectado a {cred['host']} (usuario {cred['user']}). Intentos guardados: {filas[0]['n']}. "
+                  f"Códigos autorizados cargados: {n_codigos_cargados()}.")
 
 
 # --------------------------------------------------------------------------- #

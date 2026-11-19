@@ -97,6 +97,10 @@ def login_sidebar() -> None:
         with st.form("login"):
             codigo = st.text_input("Código de estudiante")
             ingresar = st.form_submit_button("Ingresar", type="primary")
+        if str(secreto("DEBUG")).lower() == "true":
+            n = bd.n_codigos_cargados()
+            st.caption(f"🛠️ Códigos autorizados cargados desde los secretos: {n}" +
+                       ("" if n else " — no se encontró la lista `codigos`; se aceptará cualquier código."))
         if ingresar:
             codigo = codigo.strip().upper()
             if not CODIGO_RE.match(codigo):
