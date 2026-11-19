@@ -216,8 +216,9 @@ def _seleccion_cuantitativa(tema: str) -> tuple[Problema, str] | None:
         return None
 
     def fmt(p: Problema) -> str:
-        base = f"P{p.numero}" + (" ★" if p.es_modelo else "")
-        return f"{base} · {p.dimension if dimension == TODAS else _resumen(p.enunciado, 45)}"
+        marca = "★ " if p.es_modelo else ""
+        cabeza = f"{p.dimension} · " if dimension == TODAS else ""
+        return f"{marca}{cabeza}{_resumen(p.enunciado, 50)}"
 
     clave_w = f"preg_{tema}_{dimension}_{etiqueta}"   # ligada a tema+dimensión+variante
     p = st.selectbox(f"Pregunta ({len(opciones)})", opciones, format_func=fmt, key=clave_w)
@@ -325,7 +326,7 @@ def encabezado(p: Problema) -> None:
         st.markdown(f"**Caso {p.caso} · {p.tema}.** {p.contexto}")
         mostrar_datos(p)
     with st.container(border=True):
-        st.markdown(f"#### Pregunta {p.numero} · {p.dimension}  ·  {p.puntaje_max:g} pts")
+        st.markdown(f"#### {p.dimension}  ·  {p.puntaje_max:g} pts")
         st.write(p.enunciado)
 
 
