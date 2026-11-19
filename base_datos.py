@@ -1,253 +1,213 @@
-"""Persistencia en Supabase (PostgreSQL) por conexión directa al pooler.
+"""Conexión a Supabase (PostgreSQL) para guardar el avance de cada estudiante.
 
-Secretos que lee (Streamlit > Settings > Secrets):
-    db_host, db_port, db_user, db_password, db_name   (también acepta DB_HOST, DB_PORT, ...)
-    codigos   lista de códigos de estudiante con acceso (solo ellos pueden ingresar; también se acepta el nombre codigos_habilitados)
-Si falta alguno o la conexión falla, la app sigue funcionando sin guardar y muestra el motivo.
+Las credenciales NO van en el código (el repositorio es público/compartido): se leen de los secretos de Streamlit
+(Settings > Secrets en Streamlit Cloud, o .streamlit/secrets.toml en local):
+
+    db_host = "aws-1-us-east-1.pooler.supabase.com"
+    db_port = 6543
+    db_user = "postgres.<id-del-proyecto>"
+    db_password = "<tu-contraseña>"
+    db_name = "postgres"
+
+Requiere `psycopg2-binary` en requirements.txt.
+Funciones públicas (las usa app.py): disponible, verificar_codigo, guardar_intento, guardar_mensaje, cargar_intentos.
 """
 from __future__ import annotations
 
-import logging
-import os
 import re
-from contextlib import contextmanager
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from config import secreto
-from problemas import Problema
 
-log = logging.getLogger(__name__)
+try:  # la app debe seguir funcionando (sin guardar) si falta la librería
+    import psycopg2
+    import psycopg2.extras
+except ImportError:  # pragma: no cover
+    psycopg2 = None
+
+COLUMNAS_INTENTOS = ["id", "fecha_hora_lima", "codigo", "id_sesion", "n_registro_sesion", "tema", "dimension",
+                     "tiempo_resp_seg", "veredicto", "puntaje", "long_respuesta", "modelo", "error_tecnico",
+                     "enunciado", "pedido", "respuesta", "clave"]
+_ESQUEMA = Path(__file__).with_name("supabase_esquema.sql")
+_esquema_ok = False  # se activa tras crear/verificar las tablas una vez por proceso
 
 
 # --------------------------------------------------------------------------- #
 # Conexión
 # --------------------------------------------------------------------------- #
-def _param(*nombres: str, defecto: str | None = None) -> str | None:
-    for n in nombres:
-        valor = secreto(n)
-        if valor:
-            return str(valor).strip()
-    return defecto
-
-
 def _credenciales() -> dict | None:
-    host = _param("db_host", "DB_HOST")
-    user = _param("db_user", "DB_USER")
-    password = _param("db_password", "DB_PASSWORD")
-    if not (host and user and password):
+    host, usuario, clave = secreto("db_host"), secreto("db_user"), secreto("db_password")
+    if not (host and usuario and clave):
         return None
     return {
-        "host": host,
-        "port": int(_param("db_port", "DB_PORT", defecto="6543")),
-        "user": user,
-        "password": password,
-        "dbname": _param("db_name", "DB_NAME", defecto="postgres"),
-        "sslmode": _param("db_sslmode", "DB_SSLMODE", defecto="require"),
+        "host": str(host),
+        "port": int(secreto("db_port") or 6543),
+        "user": str(usuario),
+        "password": str(clave),
+        "dbname": str(secreto("db_name") or "postgres"),
+        "sslmode": "require",
         "connect_timeout": 8,
     }
 
 
 def disponible() -> bool:
-    """True si los secretos de conexión están configurados (no prueba la red)."""
-    return _credenciales() is not None
+    """True si hay librería y credenciales para intentar guardar."""
+    return psycopg2 is not None and _credenciales() is not None
 
 
-@contextmanager
-def _conexion():
-    """Conexión corta: commit al salir bien, rollback si hay error, y siempre se cierra."""
-    import psycopg2
+def _marcar_error(e: Exception) -> None:
+    # Solo el tipo y la primera línea: nunca se expone la contraseña ni la cadena de conexión.
+    st.session_state["db_error"] = f"{type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
 
-    cred = _credenciales()
-    if cred is None:
-        raise RuntimeError("Faltan los secretos db_host, db_user y db_password.")
-    con = psycopg2.connect(**cred)
+
+def _ejecutar(sql: str, params: tuple | None = None, *, leer: bool = False):
+    """Abre una conexión corta (adecuada para el pooler de Supabase), ejecuta y confirma.
+
+    Devuelve las filas (lista de dicts) si leer=True, True si escribió bien y None si hubo un error.
+    """
+    credenciales = _credenciales()
+    if psycopg2 is None or credenciales is None:
+        return None
+    conexion = None
     try:
-        with con:
-            yield con
+        conexion = psycopg2.connect(**credenciales)
+        with conexion.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            filas = [dict(f) for f in cur.fetchall()] if leer else True
+        conexion.commit()
+        return filas
+    except Exception as e:  # noqa: BLE001 - cualquier fallo de red/SQL no debe tumbar la app
+        if conexion is not None:
+            try:
+                conexion.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        _marcar_error(e)
+        return None
     finally:
-        con.close()
+        if conexion is not None:
+            conexion.close()
 
 
-def _registrar_error(e: Exception) -> None:
-    log.warning("Error de base de datos: %s", e)
-    st.session_state["db_error"] = _explicar(e)
-
-
-def _explicar(e: Exception) -> str:
-    """Traduce los errores típicos a una indicación concreta."""
-    msg = str(e)
-    bajo = msg.lower()
-    if isinstance(e, ModuleNotFoundError) or "psycopg2" in bajo and "no module" in bajo:
-        return "Falta la librería psycopg2: agrega `psycopg2-binary` a requirements.txt."
-    if "tenant or user not found" in bajo:
-        return "El pooler no reconoce el usuario: db_user debe ser 'postgres.<ref-del-proyecto>'."
-    if "password authentication failed" in bajo:
-        return "Usuario o contraseña incorrectos (db_user / db_password)."
-    if "timeout" in bajo or "could not translate host" in bajo or "connection refused" in bajo:
-        return "No se pudo alcanzar el servidor: revisa db_host y db_port (pooler: puerto 6543)."
-    if "does not exist" in bajo and "relation" in bajo:
-        return "Falta crear las tablas: ejecuta supabase_schema.sql en el SQL Editor de Supabase."
-    return msg.strip()[:300]
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def verificar_conexion() -> str:
-    """'' si todo funciona; si no, el motivo en español (para mostrarlo en la barra lateral)."""
-    if not disponible():
-        return "Faltan los secretos db_host, db_user y db_password."
-    try:
-        with _conexion() as con, con.cursor() as cur:
-            cur.execute("select to_regclass('public.evaluaciones'), to_regclass('public.guias_tutor')")
-            faltan = [n for n, r in zip(("evaluaciones", "guias_tutor"), cur.fetchone()) if r is None]
-            if faltan:
-                return ("Faltan las tablas " + " y ".join(faltan)
-                        + ": ejecuta supabase_schema.sql en el SQL Editor de Supabase.")
-        return ""
-    except Exception as e:
-        return _explicar(e)
+def _asegurar_esquema() -> None:
+    """Crea las tablas si no existen (una vez por proceso). Idempotente."""
+    global _esquema_ok
+    if _esquema_ok or not disponible():
+        return
+    if _ESQUEMA.exists() and _ejecutar(_ESQUEMA.read_text(encoding="utf-8")):
+        _esquema_ok = True
 
 
 # --------------------------------------------------------------------------- #
-# Operaciones
+# Acceso por código
 # --------------------------------------------------------------------------- #
-def _modelo_actual() -> str | None:
-    """Modelo que respondió por última vez en esta sesión (lo expone tutor.MODELO_GEMINI)."""
-    try:
-        import tutor
-
-        return str(getattr(tutor, "MODELO_GEMINI", "") or "") or None
-    except Exception:
-        return None
-
-
-def _variante_de(clave: str | None, p: Problema) -> str | None:
-    """La app identifica cada pregunta como '<variante>-<id>' (p. ej. 'var-123-P17' o 'modelo-P04')."""
-    if not clave:
-        return None
-    sufijo = f"-{p.id}"
-    return (clave[: -len(sufijo)] if clave.endswith(sufijo) else clave) or "modelo"
-
-
-def _codigos_habilitados() -> set[str]:
-    """Códigos con acceso, desde el secreto `codigos` (o `codigos_habilitados`): lista TOML o texto separado por comas/saltos de línea."""
-    valor = None
-    for nombre in ("codigos", "codigos_habilitados", "CODIGOS", "CODIGOS_HABILITADOS"):
-        try:
-            valor = st.secrets[nombre]
-        except Exception:
-            valor = os.environ.get(nombre)
-        if valor:
-            break
-    if not valor:
+def _codigos_secretos() -> set[str]:
+    """Códigos autorizados definidos en los secretos (`codigos = [...]`). Vacío si no hay lista."""
+    bruto = secreto("codigos")
+    if not bruto:
         return set()
-    if isinstance(valor, str):
-        items = re.split(r"[,;\s]+", valor)
-    else:
-        try:
-            items = [str(x) for x in valor]
-        except TypeError:
-            items = [str(valor)]
-    return {i.strip().strip("\"'").upper() for i in items if i and i.strip()}
+    if isinstance(bruto, str):          # por si se pegó como texto: "1001,1002" o con saltos de línea
+        bruto = re.split(r"[\s,;]+", bruto)
+    return {str(c).strip().upper() for c in bruto if str(c).strip()}
 
 
 def verificar_codigo(codigo: str) -> tuple[bool, str]:
-    """Solo deja ingresar a los códigos listados en el secreto `codigos`.
+    """Valida el código de estudiante.
 
-    Si el secreto no existe o está vacío, nadie ingresa (así un error de configuración no abre el acceso).
+    1. Si los secretos traen la lista `codigos`, solo ingresan esos códigos (no depende de la base de datos).
+    2. Si no hay lista: usa la tabla codigos_acceso (vacía = cualquier código con formato válido).
+    3. Sin lista ni conexión: deja ingresar (el avance simplemente no se guarda).
     """
-    habilitados = _codigos_habilitados()
-    if not habilitados:
-        return False, "El acceso aún no está configurado (faltan los códigos habilitados). Avisa a tu docente."
-    if codigo.strip().upper() in habilitados:
+    autorizados = _codigos_secretos()
+    if autorizados:
+        if codigo in autorizados:
+            return True, ""
+        return False, "Código no autorizado. Verifica que esté bien escrito o consulta con tu docente."
+    if not disponible():
         return True, ""
-    return False, "Código no habilitado. Revisa que esté bien escrito o consulta con tu docente."
+    _asegurar_esquema()
+    filas = _ejecutar(
+        "select (select count(*) from public.codigos_acceso) as total, "
+        "(select activo from public.codigos_acceso where codigo = %s) as activo",
+        (codigo,), leer=True)
+    if not filas:          # error de conexión: no bloquear al estudiante
+        return True, ""
+    total, activo = filas[0]["total"], filas[0]["activo"]
+    if total == 0 or activo:
+        return True, ""
+    if activo is False:
+        return False, "Tu código está desactivado. Consulta con tu docente."
+    return False, "Código no autorizado. Verifica que esté bien escrito o consulta con tu docente."
 
 
-# ---- Tabla 1: evaluaciones (respuestas del estudiante) ---------------------- #
-def guardar_intento(codigo: str, id_sesion: str, n_registro: int, p: Problema, tiempo_seg: int,
-                    veredicto: str, puntaje: float | None, respuesta: str,
-                    error_tecnico: str | None = None, clave: str | None = None,
-                    modelo: str | None = None) -> bool:
-    """Inserta una fila en `evaluaciones`. `fecha_hora_lima` la fija la base de datos (America/Lima).
+def probar_conexion() -> tuple[bool, str]:
+    """Diagnóstico para la barra lateral: intenta conectar, crear las tablas y contar los intentos guardados."""
+    global _esquema_ok
+    if psycopg2 is None:
+        return False, "Falta la librería psycopg2-binary en requirements.txt."
+    cred = _credenciales()
+    if cred is None:
+        return False, "Faltan db_host, db_user o db_password en los secretos."
+    st.session_state.pop("db_error", None)
+    _esquema_ok = False
+    _asegurar_esquema()
+    if st.session_state.get("db_error"):
+        return False, st.session_state["db_error"]
+    filas = _ejecutar("select count(*) as n from public.intentos", leer=True)
+    if filas is None:
+        return False, st.session_state.get("db_error", "No se pudo leer public.intentos.")
+    return True, f"Conectado a {cred['host']} (usuario {cred['user']}). Intentos guardados: {filas[0]['n']}."
 
-    `clave` es la etiqueta interna de la pregunta en la app ('<variante>-<id>'): de ahí sale `variante`.
-    La columna `clave` de la tabla guarda, en cambio, la solución de referencia.
-    """
+
+# --------------------------------------------------------------------------- #
+# Escritura
+# --------------------------------------------------------------------------- #
+def guardar_intento(codigo: str, id_sesion: str, n_registro: int, p, segundos: int, veredicto: str,
+                    puntaje: float | None, respuesta: str, error: str | None,
+                    clave: str = "", modelo: str = "") -> None:
+    """Guarda una fila en public.intentos (fecha_hora_lima y id los asigna la base de datos)."""
     if not disponible():
-        return False
-    try:
-        with _conexion() as con, con.cursor() as cur:
-            cur.execute(
-                """insert into evaluaciones
-                   (codigo, id_sesion, n_registro_sesion, id_pregunta, variante, tema, dimension,
-                    tiempo_resp_seg, veredicto, puntaje, puntaje_max, long_respuesta, modelo, error_tecnico,
-                    enunciado, pedido, respuesta, clave)
-                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (codigo, id_sesion, n_registro, p.id, _variante_de(clave, p) or "modelo", p.tema, p.dimension,
-                 tiempo_seg, veredicto, puntaje, p.puntaje_max, len(respuesta), modelo or _modelo_actual(),
-                 error_tecnico[:1000] if error_tecnico else None,
-                 f"{p.contexto}\n{getattr(p, 'datos_texto', '')}".strip(), p.enunciado, respuesta, p.referencia),
-            )
-        return True
-    except Exception as e:
-        _registrar_error(e)
-        return False
+        return
+    _asegurar_esquema()
+    enunciado = "\n".join(x for x in (p.contexto, p.datos_texto) if x)
+    ok = _ejecutar(
+        "insert into public.intentos (codigo, id_sesion, n_registro_sesion, tema, dimension, tiempo_resp_seg, "
+        "veredicto, puntaje, long_respuesta, modelo, error_tecnico, enunciado, pedido, respuesta, clave) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (codigo, id_sesion, n_registro, p.tema, p.dimension, int(segundos), veredicto, puntaje, len(respuesta),
+         modelo or None, error, enunciado, p.enunciado, respuesta, clave))
+    if ok:
+        st.session_state.pop("db_error", None)
 
 
-# ---- Tabla 2: guias_tutor (ayuda que recibe el estudiante) ------------------ #
-def guardar_mensaje(codigo: str, id_sesion: str, p: Problema, rol: str, contenido: str, nivel_pista: int,
-                    clave: str | None = None, modelo: str | None = None) -> bool:
-    """Registra UNA fila por interacción con el tutor.
-
-    La app llama primero con rol='estudiante' (se guarda en memoria) y luego con rol='tutor':
-    en ese momento se inserta la fila completa en `guias_tutor` con la consulta y la guía.
-    """
+def guardar_mensaje(codigo: str, id_sesion: str, p, rol: str, texto: str, nivel: int) -> None:
+    """Guarda un mensaje del chat con el tutor en public.mensajes_tutor."""
     if not disponible():
-        return False
-    if rol == "estudiante":
-        st.session_state["_consulta_pendiente"] = {"texto": contenido, "nivel": nivel_pista, "clave": clave}
-        return True
-
-    pendiente = st.session_state.pop("_consulta_pendiente", None) or {}
-    consulta = pendiente.get("texto") or ""
-    tipo = "pista" if consulta.lower().startswith("necesito una pista") else "consulta"
-    variante = _variante_de(clave or pendiente.get("clave"), p)
-    try:
-        with _conexion() as con, con.cursor() as cur:
-            cur.execute(
-                """insert into guias_tutor
-                   (codigo, id_sesion, n_registro_sesion, id_pregunta, variante, tema, dimension,
-                    tipo, nivel_pista, modelo, long_guia, consulta_estudiante, guia_tutor)
-                   values (%s, %s,
-                           (select coalesce(max(n_registro_sesion), 0) + 1 from guias_tutor where id_sesion = %s),
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (codigo, id_sesion, id_sesion, p.id, variante, p.tema, p.dimension,
-                 tipo, pendiente.get("nivel", nivel_pista), modelo or _modelo_actual(),
-                 len(contenido), consulta, contenido),
-            )
-        return True
-    except Exception as e:
-        _registrar_error(e)
-        return False
+        return
+    _asegurar_esquema()
+    _ejecutar(
+        "insert into public.mensajes_tutor (codigo, id_sesion, tema, dimension, id_pregunta, rol, texto, nivel_pista) "
+        "values (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (codigo, id_sesion, p.tema, p.dimension, p.id, rol, texto, int(nivel)))
 
 
-# ---- Lectura para "Mi progreso" ---------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Lectura (progreso del estudiante)
+# --------------------------------------------------------------------------- #
 def cargar_intentos(codigo: str) -> pd.DataFrame:
-    """Evaluaciones del estudiante (excluye las que fallaron por error técnico)."""
+    """Intentos del estudiante, del más reciente al más antiguo (DataFrame vacío si no hay conexión o datos)."""
+    vacio = pd.DataFrame(columns=COLUMNAS_INTENTOS)
     if not disponible():
-        return pd.DataFrame()
-    try:
-        import psycopg2.extras
-
-        with _conexion() as con, con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("select * from evaluaciones where codigo = %s order by id desc limit 500", (codigo,))
-            df = pd.DataFrame(cur.fetchall())
-    except Exception as e:
-        _registrar_error(e)
-        return pd.DataFrame()
-    if df.empty:
-        return df
-    df["puntaje"] = pd.to_numeric(df["puntaje"], errors="coerce")
-    return df.dropna(subset=["puntaje"])
+        return vacio
+    _asegurar_esquema()
+    filas = _ejecutar(
+        "select id, fecha_hora_lima, codigo, id_sesion, n_registro_sesion, tema, dimension, tiempo_resp_seg, "
+        "veredicto, puntaje::float8 as puntaje, long_respuesta, modelo, error_tecnico, clave "
+        "from public.intentos where codigo = %s order by fecha_hora_lima desc, id desc limit 500",
+        (codigo,), leer=True)
+    if not filas:
+        return vacio
+    return pd.DataFrame(filas)

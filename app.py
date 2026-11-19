@@ -170,6 +170,10 @@ def sidebar() -> tuple[Problema, str] | None:
             st.warning("No se pudo guardar algún dato en Supabase.")
             with st.expander("Detalle técnico"):
                 st.code(st.session_state["db_error"])
+        if bd.disponible() and (st.session_state.get("db_error") or str(secreto("DEBUG")).lower() == "true"):
+            if st.button("🔌 Probar conexión a Supabase", use_container_width=True):
+                ok, detalle = bd.probar_conexion()
+                (st.success if ok else st.error)(detalle)
 
         tema = st.session_state.tema
         if tema is None:
