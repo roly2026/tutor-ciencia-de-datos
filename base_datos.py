@@ -2,11 +2,14 @@
 
 Secretos que lee (Streamlit > Settings > Secrets):
     db_host, db_port, db_user, db_password, db_name   (también acepta DB_HOST, DB_PORT, ...)
+    codigos   lista de códigos de estudiante con acceso (solo ellos pueden ingresar; también se acepta el nombre codigos_habilitados)
 Si falta alguno o la conexión falla, la app sigue funcionando sin guardar y muestra el motivo.
 """
 from __future__ import annotations
 
 import logging
+import os
+import re
 from contextlib import contextmanager
 
 import pandas as pd
@@ -127,25 +130,39 @@ def _variante_de(clave: str | None, p: Problema) -> str | None:
     return (clave[: -len(sufijo)] if clave.endswith(sufijo) else clave) or "modelo"
 
 
+def _codigos_habilitados() -> set[str]:
+    """Códigos con acceso, desde el secreto `codigos` (o `codigos_habilitados`): lista TOML o texto separado por comas/saltos de línea."""
+    valor = None
+    for nombre in ("codigos", "codigos_habilitados", "CODIGOS", "CODIGOS_HABILITADOS"):
+        try:
+            valor = st.secrets[nombre]
+        except Exception:
+            valor = os.environ.get(nombre)
+        if valor:
+            break
+    if not valor:
+        return set()
+    if isinstance(valor, str):
+        items = re.split(r"[,;\s]+", valor)
+    else:
+        try:
+            items = [str(x) for x in valor]
+        except TypeError:
+            items = [str(valor)]
+    return {i.strip().strip("\"'").upper() for i in items if i and i.strip()}
+
+
 def verificar_codigo(codigo: str) -> tuple[bool, str]:
-    """Si existe `codigos_habilitados` y tiene filas, solo entran esos códigos; si no, entra cualquiera."""
-    if not disponible():
+    """Solo deja ingresar a los códigos listados en el secreto `codigos`.
+
+    Si el secreto no existe o está vacío, nadie ingresa (así un error de configuración no abre el acceso).
+    """
+    habilitados = _codigos_habilitados()
+    if not habilitados:
+        return False, "El acceso aún no está configurado (faltan los códigos habilitados). Avisa a tu docente."
+    if codigo.strip().upper() in habilitados:
         return True, ""
-    try:
-        with _conexion() as con, con.cursor() as cur:
-            cur.execute("select to_regclass('public.codigos_habilitados')")
-            if cur.fetchone()[0] is None:
-                return True, ""
-            cur.execute("select count(*) from codigos_habilitados")
-            if cur.fetchone()[0] == 0:
-                return True, ""
-            cur.execute("select 1 from codigos_habilitados where codigo = %s", (codigo,))
-            if cur.fetchone():
-                return True, ""
-        return False, "Código no habilitado. Revisa que esté bien escrito o consulta con tu docente."
-    except Exception as e:
-        _registrar_error(e)
-        return True, ""
+    return False, "Código no habilitado. Revisa que esté bien escrito o consulta con tu docente."
 
 
 # ---- Tabla 1: evaluaciones (respuestas del estudiante) ---------------------- #
